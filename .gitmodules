@@ -1,0 +1,9 @@
+[submodule "lib/MQTT"]
+	path = lib/MQTT
+	url = https://github.com/hirotakaster/MQTT.git
+[submodule "lib/PublishManager"]
+	path = lib/PublishManager
+	url = https://github.com/bveenema/PublishManager.git
+[submodule "lib/ArduinoJson"]
+	path = lib/ArduinoJson
+	url = https://github.com/bblanchon/ArduinoJson.git
