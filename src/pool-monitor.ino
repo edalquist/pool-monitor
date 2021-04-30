@@ -22,12 +22,10 @@ SYSTEM_THREAD(ENABLED);
 STARTUP(WiFi.selectAntenna(ANT_AUTO));
 STARTUP(Particle.publishVitals(LONG_SLEEP_DURATION));
 
-// Temp sensor setup
-DS18B20 ds18b20(DS18B20_PIN);
-// TODO make this a struct look door info on lfl
-const int nSENSORS = 2;
-float poolTemps[nSENSORS] = {NAN, NAN};
-retained uint8_t sensorAddresses[nSENSORS][8];
+// Temp sensors
+tempmonitor_t fromPool = {DS18B20(D0, true), NAN, NAN, 0UL};
+tempmonitor_t fromHeater = {DS18B20(D1, true), NAN, NAN, 0UL};
+sensoroffsets_t offsets;
 
 // MQTT Client Setup
 MQTT mqttClient(MQTT_SERVER, MQTT_PORT, mqttCallback, 512);
@@ -36,17 +34,12 @@ bool mqttDiscoveryPublished = false;
 // Setup logging
 SerialLogHandler logHandler;
 
-// Particle Variables
-double fromPoolTemp = 0;    // Temp of water coming from pool
-double fromHeaterTemp = 0;  // Temp of water coming from heater
-
-char configTopic[128];
+// char configTopic[128];
 
 // local state
 bool foundSensors = false;
 time32_t lastConnect = 0UL;
 time32_t lastWifiEvent = 0UL;
-time32_t lastTempEvent = 0UL;
 uint64_t lastMqttEventSent = 0UL;
 CircularBuffer<mqttevent_t> eventQueue(MAX_EVENT_QUEUE);
 
@@ -70,18 +63,55 @@ void watchdogHandler() {
   System.reset(RESET_NO_WAIT);
 }
 
+int setFromPoolOffset(String payload) {
+  Log.info("setFromPoolOffset(%f)", payload.toFloat());
+  offsets.fromPool = payload.toFloat();
+  EEPROM.put(0, offsets);
+  return 0;
+}
+
+float fromPoolOffset() {
+  return offsets.fromPool;
+}
+
+int setFromHeaterOffset(String payload) {
+  Log.info("setFromHeaterOffset(%f)", payload.toFloat());
+  offsets.fromHeater = payload.toFloat();
+  EEPROM.put(0, offsets);
+  return 0;
+}
+
+float fromHeaterOffset() {
+  return offsets.fromHeater;
+}
+
+float fromPoolTemp() {
+  return fromPool.lastReadValue;
+}
+
+float fromHeaterTemp() {
+  return fromHeater.lastReadValue;
+}
+
+
 void setup() {
   // After 60s of no loop completion reset the device
   wd = new ApplicationWatchdog(60s, watchdogHandler);
 
   Serial.begin(9600);
 
+  Particle.function("setFromPoolOffset", setFromPoolOffset);
+  Particle.variable("fromPoolOffset", fromPoolOffset);
+  Particle.function("setFromHeaterOffset", setFromHeaterOffset);
+  Particle.variable("fromHeaterOffset", fromHeaterOffset);
   Particle.variable("fromPoolTemp", fromPoolTemp);
   Particle.variable("fromHeaterTemp", fromHeaterTemp);
 
-  delay(2000);
-
-  findSensors();
+  // // You can even store a small structure of values
+  EEPROM.get(0, offsets);
+  if (isnan(offsets.fromPool)) offsets.fromPool = 0;
+  if (isnan(offsets.fromHeater)) offsets.fromHeater = 0;
+  Log.info("Offsets: fromPool=%f fromHeater=%f", offsets.fromPool, offsets.fromHeater);
 
   waitFor(Time.isValid, 30000);
 }
@@ -91,34 +121,12 @@ void loop() {
   mqttConnect();
 
   publishDiscovery();
-  findSensors();
 
   updateTemperatureStatus();
   updateWifiStatus();
   sendMqttEvents();
 
-  delay(500);
-}
-
-void findSensors() {
-  if (!foundSensors) {
-    int foundcount = 0;
-    ATOMIC_BLOCK() {
-      ds18b20.resetsearch();                 // initialise for sensor search
-      for (int i = 0; i < nSENSORS; i++) {   // try to read the sensor addresses
-        if (ds18b20.search(sensorAddresses[i])) {
-          foundcount++;
-          auto addr = sensorAddresses[i];
-          Log.info("DS18B20: Sensor %d at %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
-            i, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
-        }
-      }
-    }
-    foundSensors = nSENSORS == foundcount;
-    Log.info("Found: %d of %d temp sensors", foundcount, nSENSORS);
-  } else {
-    Log.info("Sensors already found");
-  }
+  delay(7);
 }
 
 /**
@@ -154,8 +162,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
  * @return true if MQTT server connected, false if not.
  */
 bool mqttConnect() {
-  if (1==1) return false;
-
   // Call loop, return if successful
   if (mqttClient.loop()) {
     lastConnect = Time.now();
@@ -179,8 +185,8 @@ bool mqttConnect() {
     return false;
   }
 
-  mqttClient.subscribe(configTopic);
-  Log.info("MQTT: Subscribed - %s", configTopic);
+  // mqttClient.subscribe(configTopic);
+  // Log.info("MQTT: Subscribed - %s", configTopic);
 
   lastConnect = Time.now();
   publishManager.publish("mqtt/connection", "established");
@@ -278,49 +284,56 @@ void publishDiscovery() {
 }
 
 void updateTemperatureStatus() {
-  // TODO do we want a running average here?
-  float maxDiff = 0;
-  for (int i = 0; i < nSENSORS; i++) {
-    float temp = getTemp(sensorAddresses[i]);
-    if (!isnan(temp)) {
-      if (!isnan(poolTemps[i])) {
-        maxDiff = max(maxDiff, fabs(temp - poolTemps[i]));
-      }
-      poolTemps[i] = temp;
-    }
-  }
+  float diff, maxDiff = 0;
+  diff = getTemp(&fromPool, offsets.fromPool);
+  if (!isnan(diff)) maxDiff = max(maxDiff, fabs(diff));
+  diff = getTemp(&fromHeater, offsets.fromHeater);
+  if (!isnan(diff)) maxDiff = max(maxDiff, fabs(diff));
 
-  if (maxDiff < 0.1 && Time.now() <= (lastTempEvent + EVENT_REFRESH_INTRV.count())) {
+  Log.info("DS18B20: Max Diff %f", maxDiff);
+
+  auto now = Time.now();
+  if (maxDiff < TEMP_PUBLISH_DIFF
+      && now <= (fromPool.lastSentTime + EVENT_REFRESH_INTRV.count())
+      && now <= (fromHeater.lastSentTime + EVENT_REFRESH_INTRV.count())) {
     return;
   }
 
   mqttevent_t mqttEvent;
   mqttEvent.timestamp = System.millis();
-  mqttEvent.tempEvent = {true, poolTemps[FROM_POOL_PIN], poolTemps[FROM_HEAT_PIN]};
+  mqttEvent.tempEvent = {
+    true,
+    fromPool.lastReadValue,
+    fromHeater.lastReadValue};
   eventQueue.put(mqttEvent);
-  lastTempEvent = Time.now();
 
-  publishManager.publish("poolTemp", String::format("pool: %f, heater: %f", poolTemps[FROM_POOL_PIN], poolTemps[FROM_HEAT_PIN]));
+  fromPool.lastSentTime = now;
+  fromPool.lastSentValue = fromPool.lastReadValue;
+  fromHeater.lastSentTime = now;
+  fromHeater.lastSentValue = fromHeater.lastReadValue;
+
+  publishManager.publish("poolTemp", String::format("pool: %f, heater: %f", fromPool.lastSentValue, fromHeater.lastSentValue));
 }
 
-double getTemp(uint8_t addr[8]) {
-  double _temp;
+float getTemp(tempmonitor_t* monitor, float offset) {
+  if (isnan(offset)) offset = 0;
+  float _temp;
   int   i = 0;
-
   do {
-    _temp = ds18b20.getTemperature(addr);
-  } while (!ds18b20.crcCheck() && DS18B20_MAXRETRY > i++);
+    _temp = (*monitor).sensor.getTemperature();
+  } while (!(*monitor).sensor.crcCheck() && DS18B20_MAXRETRY > i++);
 
   if (i < DS18B20_MAXRETRY) {
-    _temp = ds18b20.convertToFahrenheit(_temp);
+    _temp = (*monitor).sensor.convertToFahrenheit(_temp) + offset;
+    Log.info("DS18B20: %f", _temp);
   }
   else {
     _temp = NAN;
-    Log.info("DS18B20: Max Retries for %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X",
-      addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]);
+    Log.info("DS18B20: Max Retries for TODO");
   }
+  (*monitor).lastReadValue = _temp;
 
-  return _temp;
+  return (*monitor).lastReadValue - (*monitor).lastSentValue;
 }
 
 void updateWifiStatus() {

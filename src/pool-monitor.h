@@ -1,15 +1,27 @@
 #define ARDUINOJSON_ENABLE_ARDUINO_STRING 1
 #include <ArduinoJson.h>
+#include <DS18B20.h>
 
-#define DS18B20_PIN D0
-#define FROM_POOL_PIN 0
-#define FROM_HEAT_PIN 1
+// How many open/close events to queue at most
+static const size_t AVG_EVENT_COUNT = 20;
+
+struct sensoroffsets_t {
+	float fromPool = 0;
+	float fromHeater = 0;
+};
 
 // Header Like Section
+struct tempmonitor_t {
+  DS18B20 sensor;
+  float lastReadValue;
+  float lastSentValue;
+  time32_t lastSentTime;
+};
+
 struct tempevent_t {
   bool set = false;
-  double fromPoolTemp;
-  double fromHeaterTemp;
+  float fromPoolTemp;
+  float fromHeaterTemp;
 };
 
 struct wifievent_t {
@@ -25,13 +37,14 @@ struct mqttevent_t {
   struct wifievent_t wifiEvent;
 };
 
-void findSensors();
+int setFromPoolOffset(String payload);
+int setFromHeaterOffset(String payload);
 bool mqttConnect();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
 void addDevice(DynamicJsonDocument* doc);
 void publishDiscovery();
 void updateTemperatureStatus();
-double getTemp(uint8_t addr[8]);
+float getTemp(tempmonitor_t* monitor, float offset);
 void updateWifiStatus();
 void sendWifiStatus();
 void updateTempState();
@@ -49,9 +62,8 @@ static const char* HA_TEMP_TOPIC = "particle/ha/%s/temperature";
 static const char* HA_WIFI_TOPIC = "particle/ha/%s/wifi";
 
 
-static const int DS18B20_MAXRETRY = 3;
-static const uint32_t DS18B20_msSampleTime = 2500;
-static const uint32_t DS18B20_msPublishTime = 30000;
+static const uint8_t DS18B20_MAXRETRY = 3;
+static const float TEMP_PUBLISH_DIFF = 0.2;
 
 static const std::chrono::duration<int, std::milli> EVENT_RATE_LIMIT_MILLIS =
     250ms;
@@ -68,10 +80,3 @@ static const std::chrono::duration<uint64_t, std::milli> DEBOUNCE_DELAY_MILLIS =
 static const size_t MAX_EVENT_QUEUE = 20;
 
 static const double EMA_ALPHA = 0.80;
-
-static LEDStatus doorOpenLED(RGB_COLOR_RED, LED_PATTERN_FADE, LED_SPEED_NORMAL,
-                             LED_PRIORITY_IMPORTANT);
-static LEDStatus doorClosedLED(RGB_COLOR_GREEN, LED_PATTERN_FADE,
-                               LED_SPEED_NORMAL, LED_PRIORITY_IMPORTANT);
-static LEDStatus sensorErrorLED(RGB_COLOR_ORANGE, LED_PATTERN_BLINK,
-                                LED_SPEED_NORMAL, LED_PRIORITY_IMPORTANT);
