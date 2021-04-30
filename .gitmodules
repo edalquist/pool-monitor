@@ -7,3 +7,9 @@
 [submodule "lib/ArduinoJson"]
 	path = lib/ArduinoJson
 	url = https://github.com/bblanchon/ArduinoJson.git
+[submodule "lib/DS18B20"]
+	path = lib/DS18B20
+	url = https://github.com/eliteio/DS18B20.git
+[submodule "lib/OneWire"]
+	path = lib/OneWire
+	url = https://github.com/particle-iot/OneWireLibrary.git
