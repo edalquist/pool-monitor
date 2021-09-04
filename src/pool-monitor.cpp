@@ -49,12 +49,12 @@ STARTUP(WiFi.selectAntenna(ANT_AUTO));
 STARTUP(Particle.publishVitals(LONG_SLEEP_DURATION));
 
 // Temp sensors
-tempmonitor_t fromPool = {DS18B20(D0, true), NAN, NAN, 0UL};
-tempmonitor_t fromHeater = {DS18B20(D1, true), NAN, NAN, 0UL};
+tempmonitor_t fromPool = {DS18B20(D1, true), NAN, NAN, 0UL};
+tempmonitor_t fromHeater = {DS18B20(D0, true), NAN, NAN, 0UL};
 sensoroffsets_t offsets;
 
 // MQTT Client Setup
-MQTT mqttClient(MQTT_SERVER, MQTT_PORT, mqttCallback, 512);
+MQTT mqttClient(MQTT_SERVER, MQTT_PORT, 512, mqttCallback);
 bool mqttDiscoveryPublished = false;
 
 // Setup logging
@@ -69,7 +69,7 @@ time32_t lastWifiEvent = 0UL;
 uint64_t lastMqttEventSent = 0UL;
 CircularBuffer<mqttevent_t> eventQueue(MAX_EVENT_QUEUE);
 
-char formatBuffer[128];
+char formatBuffer[256];
 char* jsptf(const char* format, ...) {
   va_list va;
   va_start(va, format);
@@ -137,7 +137,7 @@ void setup() {
   EEPROM.get(0, offsets);
   if (isnan(offsets.fromPool)) offsets.fromPool = 0;
   if (isnan(offsets.fromHeater)) offsets.fromHeater = 0;
-  Log.info("fromPool=%f fromHeater=%f sizeof(offsets)=%d", offsets.fromPool, offsets.fromHeater, sizeof(offsets));
+  Log.info("Offsets: fromPool=%f fromHeater=%f", offsets.fromPool, offsets.fromHeater);
 
   waitFor(Time.isValid, 30000);
 }
@@ -206,7 +206,7 @@ bool mqttConnect() {
   if (!mqttClient.isConnected()) {
     // connection failed
     // TODO need to rate limit these in case of a bad connection
-    publishManager.publish("mqtt/log", "connection failed");
+    // publishManager.publish("mqtt/log", "connection failed");
     Log.error("MQTT: Connect Failed");
     return false;
   }
@@ -215,7 +215,7 @@ bool mqttConnect() {
   // Log.info("MQTT: Subscribed - %s", configTopic);
 
   lastConnect = Time.now();
-  publishManager.publish("mqtt/connection", "established");
+  // publishManager.publish("mqtt/connection", "established");
   Log.info("MQTT: Connected");
   return true;
 }
@@ -338,7 +338,7 @@ void updateTemperatureStatus() {
   fromHeater.lastSentTime = now;
   fromHeater.lastSentValue = fromHeater.lastReadValue;
 
-  publishManager.publish("poolTemp", String::format("pool: %f, heater: %f", fromPool.lastSentValue, fromHeater.lastSentValue));
+  // publishManager.publish("poolTemp", String::format("pool: %f, heater: %f", fromPool.lastSentValue, fromHeater.lastSentValue));
 }
 
 float getTemp(tempmonitor_t* monitor, float offset) {
@@ -444,5 +444,5 @@ void publishJson(const char* topic, DynamicJsonDocument* doc, bool retain) {
 
   Log.info("MQTT: %s\t%s", formattedTopic.c_str(), output);
   mqttClient.publish(formattedTopic, output, retain);
-  publishManager.publish("mqtt/publishJson", formattedTopic);
+  // publishManager.publish("mqtt/publishJson", formattedTopic);
 }
