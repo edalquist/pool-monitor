@@ -2,7 +2,7 @@
 src/credentials.h
 
 # Generated Files
-src/little-free-library-monitor.cpp
+src/*.cpp
 
 # Compiled Output
 target/
