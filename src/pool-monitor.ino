@@ -11,6 +11,7 @@ SYSTEM_THREAD(ENABLED);
 
 PapertrailLogHandler papertailHandler("logs5.papertrailapp.com", 31106,
                                       "PoolMonitor");
+SerialLogHandler logHandler;
 // OneWire option: ignore the search code for devices/device addresses
 #define ONEWIRE_SEARCH 0
 // OneWire option: enable the CRC code
@@ -68,7 +69,7 @@ enum DS18B20_CONVERSION_TIME : uint16_t {
 //  defines project specific DS18B20 Sampling Interval, which determines how
 //  often to sample the DS18B20 devices...in this code, interval reschedules
 //  automatically, but could be changed or implemented as a one-shot.
-#define DS18B20_SAMPLE_INTERVAL 0
+#define DS18B20_SAMPLE_INTERVAL 1000
 
 // publishing temperature differential, publish the data immediately (subject to
 // PUBLISH_MIN_INTERVAL) if its temperature differential from the previous
@@ -76,7 +77,7 @@ enum DS18B20_CONVERSION_TIME : uint16_t {
 // comparison
 // ...An easy way to get quick publishes during testing...grab a probe with your
 // hand and raise its temperature
-#define PUBLISH_TEMPERATURE_DIFF 0.1
+#define PUBLISH_TEMPERATURE_DIFF 0.2
 
 #define NUM_DS18B20_DEVICES 4
 const uint8_t DS18B20_OneWire_ADDRESSES[NUM_DS18B20_DEVICES][8] = {
@@ -101,7 +102,7 @@ float f_current_temps_pub[NUM_DS18B20_DEVICES];
 OneWire ds18b20_onewire(DS18B20_PIN_ONEWIRE);  // instantiate the OneWire bus
 
 // set at the beginning of each pass through loop()
-unsigned long currentMillis;
+system_tick_t currentMillis;
 // TESTING CODE , keeps track of the total # of DS18B20 conversions
 long int conversion_count_DS18B20;
 // TESTING CODE , keeps track of the total # of CRC errors in DS18B20
@@ -129,11 +130,21 @@ float f_current_lpm[NUM_FLOW_SENSORS];
 // last published current flow rate readings from sensors
 float f_current_lpm_pub[NUM_FLOW_SENSORS];
 
+#define PUBLISH_INTERVAL_SEC 60
+uint32_t publishInterval = PUBLISH_INTERVAL_SEC;
+system_tick_t lastPublishTime = 0;
+
 time32_t mqttLastConnect = 0UL;
 char mqttConfigTopic[128];
+char haDeviceName[32];
+char haStateTopic[100];
+
+bool tempOffsetsLogged = false;
+TempOffsets loadedTempOffsets;
+TempOffsets tempOffsets;
 
 // MQTT Client Setup
-MQTT mqttClient(MQTT_SERVER, MQTT_PORT, mqttCallback, 512);
+MQTT mqttClient(MQTT_SERVER, MQTT_PORT, /* buffer */ 512, mqttCallback);
 bool mqttDiscoveryPublished = false;
 
 // setup() runs once, when the device is first turned on.
@@ -152,76 +163,80 @@ void setup() {
   attachInterrupt(A4, tick4, RISING);
 
   snprintf(mqttConfigTopic, sizeof(mqttConfigTopic), CONFIG_TOPIC, DEVICE_NAME);
+  if (MQTT_TESTING) {
+    snprintf(haDeviceName, sizeof(haDeviceName), "%s_test", DEVICE_NAME);
+  } else {
+    snprintf(haDeviceName, sizeof(haDeviceName), "%s", DEVICE_NAME);
+  }
+  snprintf(haStateTopic, sizeof(haStateTopic), "particle/ha/%s/state",
+           haDeviceName);
+
+  EEPROM.get(TEMP_OFFSET_ADDR, loadedTempOffsets);
+  if (loadedTempOffsets.version != TEMP_OFFSET_VERSION) {
+    tempOffsets = {TEMP_OFFSET_VERSION, 0, 0, 0, 0};
+  } else {
+    tempOffsets = loadedTempOffsets;
+  }
 }
+
+double round1(double value) { return (int)(value * 10 + 0.5) / 10.0; }
 
 // loop() runs over and over again, as quickly as it can execute.
 void loop() {
   currentMillis = millis();
 
-  mqttConnect();
+  if (!tempOffsetsLogged && currentMillis > 2000) {
+    Log.info("TempOffsets(%d): %f, %f, %f, %f", tempOffsets.version,
+             tempOffsets.offset[0], tempOffsets.offset[1],
+             tempOffsets.offset[2], tempOffsets.offset[3]);
+    if (loadedTempOffsets.version != TEMP_OFFSET_VERSION) {
+      Log.info("TempOffsets were invalid (%d != %d) and reset: %f, %f, %f, %f",
+               loadedTempOffsets.version, TEMP_OFFSET_VERSION,
+               loadedTempOffsets.offset[0], loadedTempOffsets.offset[1],
+               loadedTempOffsets.offset[2], loadedTempOffsets.offset[3]);
+    }
+    tempOffsetsLogged = true;
+  }
 
-  bool shouldPublish = false;
-  shouldPublish = sampleFlowMeters() || shouldPublish;
+  bool mqttConnected = mqttLoop();
+  if (mqttConnected && millis() > 5000) {
+    publishDiscovery();
+  }
 
   // When ready, update the current DS18B20 temperature readings
   if (DS18B20_SamplingComplete()) {
-    shouldPublish = doTemperatureCalculations() || shouldPublish;
-    if (shouldPublish) {
-      lastTickReadTime = millis();
+    bool shouldPublish =
+        doTemperatureCalculations() || sampleFlowMeters() ||
+        (currentMillis - lastPublishTime) / 1000 > publishInterval;
 
-      Serial.printlnf(
-          "{\"T0\":%.1f"
-          ",\"T1\":%.1f"
-          ",\"T2\":%.1f"
-          ",\"T3\":%.1f"
-          ",\"CC\":%ld"
-          ",\"ERR_CRC\":%ld"
-          ",\"ERR_CRCF\":%ld"
-          ",\"F0\":%.1f"
-          ",\"F1\":%.1f"
-          ",\"F2\":%.1f"
-          ",\"F3\":%.1f"
-          "}",
-          f_current_temps[0], f_current_temps[1], f_current_temps[2],
-          f_current_temps[3], conversion_count_DS18B20, crc_error_count_DS18B20,
-          crc_fail_count_DS18B20, f_current_lpm[0], f_current_lpm[1],
-          f_current_lpm[2], f_current_lpm[3]);
+    if (shouldPublish) {
+      StaticJsonDocument<200> doc;
+      char key[8];
+      for (int i = 0; i < NUM_DS18B20_DEVICES; i++) {
+        snprintf(key, sizeof(key), "temp_%d", i);
+        doc[key] = round1(f_current_temps[i] + tempOffsets.offset[i]);
+      }
+      for (int i = 0; i < NUM_DS18B20_DEVICES; i++) {
+        snprintf(key, sizeof(key), "flow_%d", i);
+        doc[key] = round1(f_current_lpm[i]);
+      }
+
+      serializeJson(doc, Serial);
+      Serial.println();
+      mqttPublishJson(haStateTopic, &doc, false);
+      lastPublishTime = currentMillis;
     }
   }
-
-  // system_tick_t currentTime = millis();
-  // if (lastReadTime == 0) {
-  //   lastReadTime = currentTime;
-  // } else if ((currentTime - lastReadTime) > 1000) {
-  //   double secondsPassed = (currentTime - lastReadTime) / 1000.0;
-
-  //   auto lpm1 = readLpm(currentTime, secondsPassed, &tick1Count);
-  //   auto lpm2 = readLpm(currentTime, secondsPassed, &tick2Count);
-  //   auto lpm3 = readLpm(currentTime, secondsPassed, &tick3Count);
-  //   auto lpm4 = readLpm(currentTime, secondsPassed, &tick4Count);
-  //   lastReadTime = currentTime;
-
-  //   // Serial.printlnf("%fs, %d ticks, %fhz, %f l/m", secondsPassed, ticks,
-  //   // frequency, lpm);
-  //   Serial.printlnf(
-  //       "{\"F0\":%.1f"
-  //       ",\"F1\":%.1f"
-  //       ",\"F2\":%.1f"
-  //       ",\"F3\":%.1f"
-  //       "}",
-  //       lpm1, lpm2, lpm3, lpm4);
-  // }
 }
 
 bool sampleFlowMeters() {
-  system_tick_t currentTime = millis();
-  double secondsPassed = (currentTime - lastTickReadTime) / 1000.0;
+  double secondsPassed = (currentMillis - lastTickReadTime) / 1000.0;
 
-  f_current_lpm[0] = readLpm(currentTime, secondsPassed, &tick1Count);
-  f_current_lpm[1] = readLpm(currentTime, secondsPassed, &tick2Count);
-  f_current_lpm[2] = readLpm(currentTime, secondsPassed, &tick3Count);
-  f_current_lpm[3] = readLpm(currentTime, secondsPassed, &tick4Count);
-  lastTickReadTime = currentTime;
+  f_current_lpm[0] = readLpm(currentMillis, secondsPassed, &tick1Count);
+  f_current_lpm[1] = readLpm(currentMillis, secondsPassed, &tick2Count);
+  f_current_lpm[2] = readLpm(currentMillis, secondsPassed, &tick3Count);
+  f_current_lpm[3] = readLpm(currentMillis, secondsPassed, &tick4Count);
+  lastTickReadTime = currentMillis;
 
   bool changed = false;
   for (int i = 0; i < NUM_FLOW_SENSORS; i++) {
@@ -235,28 +250,108 @@ bool sampleFlowMeters() {
   return changed;
 }
 
+// lpm   85 < .. <  62
+// gph 1347        982 (2100 rated 1.6A)
+// (0.166 GPM / Ft2)
+// gpm 12*13*0.166 = 25.896 > 1553.76gph ideal
 double readLpm(system_tick_t currentTime, double secondsPassed,
                volatile int* ticksCount) {
   int ticks = *ticksCount;
   *ticksCount = 0;
   return (ticks / secondsPassed) / 0.5;
 }
-// lpm   85 < .. <  62
-// gph 1347        982 (2100 rated 1.6A)
-// (0.166 GPM / Ft2)
-// gpm 12*13*0.166 = 25.896 > 1553.76gph ideal
 
 void tick1() { tick1Count++; }
 void tick2() { tick2Count++; }
 void tick3() { tick3Count++; }
 void tick4() { tick4Count++; }
 
+#define HA_SENSOR_EXPIRATION_SEC 300
+static const char* HA_DEVICE_MODEL = "photon";
+static const char* HA_TEMP_SENSOR_ID = "temp_sensor";
+static const char* HA_FLOW_SENSOR_ID = "flow_sensor";
+
+void publishDiscovery() {
+  if (mqttDiscoveryPublished) {
+    return;
+  }
+  Log.info("MQTT: Start Publish Discovery: %s", haDeviceName);
+  String configTopic;
+
+  StaticJsonDocument<512> doc;
+
+  // Build device descriptions
+  haDiscoveryAddDevice(&doc);
+  doc["state_topic"] = haStateTopic;
+  doc["expire_after"] = HA_SENSOR_EXPIRATION_SEC;
+  doc["force_update"] = (bool)true;
+
+  for (int i = 1; i <= NUM_FLOW_SENSORS; i++) {
+    doc["unit_of_measurement"] = "L/min";
+    doc["name"] = String::format("%s Flow Sensor %d", HA_FRIENDLY_NAME, i);
+    doc["unique_id"] =
+        String::format("%s_%s_%d", haDeviceName, HA_FLOW_SENSOR_ID, i);
+    doc["value_template"] = String::format("{{ value_json.flow_%d }}", i);
+    configTopic =
+        String::format("%s/sensor/%s/%s_%d/config", MQTT_HA_DISCOVERY_TOPIC,
+                       haDeviceName, HA_FLOW_SENSOR_ID, i);
+    mqttPublishJson(configTopic.c_str(), &doc, true);
+    doc.garbageCollect();
+  }
+
+  doc["device_class"] = "temperature";
+  doc["unit_of_measurement"] = "°F";
+  for (int i = 1; i <= NUM_DS18B20_DEVICES; i++) {
+    doc["name"] = String::format("%s Temp Sensor %d", HA_FRIENDLY_NAME, i);
+    doc["unique_id"] =
+        String::format("%s_%s_%d", haDeviceName, HA_TEMP_SENSOR_ID, i);
+    doc["value_template"] = String::format("{{ value_json.temp_%d }}", i);
+    configTopic =
+        String::format("%s/sensor/%s/%s_%d/config", MQTT_HA_DISCOVERY_TOPIC,
+                       haDeviceName, HA_TEMP_SENSOR_ID, i);
+    mqttPublishJson(configTopic.c_str(), &doc, true);
+    doc.garbageCollect();
+  }
+
+  mqttDiscoveryPublished = true;
+}
+
+void haDiscoveryAddDevice(JsonDocument* doc) {
+  JsonObject device = (*doc).createNestedObject("device");
+  device["name"] = HA_FRIENDLY_NAME;
+  device["model"] = HA_DEVICE_MODEL;
+  device["manufacturer"] = "edalquist";
+  JsonArray identifiers = device.createNestedArray("identifiers");
+  identifiers.add(haDeviceName);
+  identifiers.add(System.deviceID());
+}
+
+/**
+ * Publish JSON to MQTT
+ */
+void mqttPublishJson(const char* topic, JsonDocument* doc, bool retain) {
+  String formattedTopic;
+  if (MQTT_TESTING) {
+    formattedTopic = String::format("TEST/%s", topic);
+  } else {
+    formattedTopic = String(topic);
+  }
+
+  size_t docSize = measureJson(*doc);
+  char output[docSize + 1];
+  serializeJson(*doc, output, sizeof(output));
+
+  // Log.info("MQTT: %s\t%d bytes: %s", formattedTopic.c_str(), docSize,
+  // output);
+  mqttClient.publish(formattedTopic, output, retain);
+}
+
 /**
  * Call loop, if that fails attempt to connect to MQTT server.
  *
  * @return true if MQTT server connected, false if not.
  */
-bool mqttConnect() {
+bool mqttLoop() {
   // Call loop, return if successful
   if (mqttClient.loop()) {
     return true;
@@ -297,9 +392,52 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   char p[length + 1];
   memcpy(p, payload, length);
   p[length] = 0;
+  Log.info("MQTT Callback: %s\n%s", topic, p);
 
-  // publishManager.publish("mqtt/callback", topic);
-  Log.info("MQTT: %s\n%s", topic, p);
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, p);
+  // Test if parsing succeeds.
+  if (error) {
+    Log.error("deserializeJson() failed: %s", error.c_str());
+    return;
+  }
+
+  serializeJson(doc, Serial);
+  Serial.println();
+
+  if (doc["interval"] > 1) {
+    publishInterval = doc["interval"];
+    Log.info("Updating publish interval to %d", publishInterval);
+  }
+
+  if (doc["calibrate"]) {
+    Log.info("Calibrating temp sensors: TempOffsets(%d): %f, %f, %f, %f",
+             tempOffsets.version, tempOffsets.offset[0], tempOffsets.offset[1],
+             tempOffsets.offset[2], tempOffsets.offset[3]);
+
+    // Calculate average of current temps
+    float averageTemp = f_current_temps[0];
+    for (int i = 1; i < NUM_DS18B20_DEVICES; i++) {
+      averageTemp += f_current_temps[i];
+    }
+    averageTemp = averageTemp / NUM_DS18B20_DEVICES;
+
+    Log.info("Average temp: %f", averageTemp);
+
+    // Assign offset from average for each temp
+    for (int i = 0; i < NUM_DS18B20_OFFSETS; i++) {
+      if (i < NUM_DS18B20_DEVICES) {
+        tempOffsets.offset[i] = averageTemp - f_current_temps[i];
+      } else {
+        tempOffsets.offset[i] = 0;
+      }
+    }
+
+    EEPROM.put(TEMP_OFFSET_ADDR, tempOffsets);
+    Log.info("Calibration complete: TempOffsets(%d): %f, %f, %f, %f",
+             tempOffsets.version, tempOffsets.offset[0], tempOffsets.offset[1],
+             tempOffsets.offset[2], tempOffsets.offset[3]);
+  }
 }
 
 // this function sets the resolution for ALL ds18b20s on an instantiated OneWire
@@ -477,7 +615,7 @@ bool DS18B20_SamplingComplete() {
 // f_current_temps[NUM_DS18B20_DEVICES]
 bool doTemperatureCalculations() {
   float temperature;
-  bool changed;
+  bool changed = false;
   for (uint8_t i = 0; i < NUM_DS18B20_DEVICES; i++) {
     // temperature = current_temps_raw[i] / 16.0;  // this is the Celsius
     // calculation read from the ds18b20
